@@ -18,8 +18,13 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -32,6 +37,7 @@ import (
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-github/v57/github"
 	"github.com/gregjones/httpcache"
 	"github.com/qiniu/reviewbot/config"
@@ -44,6 +50,7 @@ import (
 )
 
 type Server struct {
+	codeCacheDir     string
 	gitClientFactory gitv2.ClientFactory
 	config           config.Config
 
@@ -359,10 +366,12 @@ func (s *Server) handle(ctx context.Context, event *github.PullRequestEvent) err
 	}()
 
 	installationID := event.GetInstallation().GetID()
+	// installationID := int64(56248106)
 	log.Infof("processing pull request %d, (%v/%v), installationID: %d\n", num, org, repo, installationID)
 
 	pullRequestAffectedFiles, response, err := linters.ListPullRequestsFiles(ctx, s.GithubClient(installationID), org, repo, num)
 	if err != nil {
+		log.Errorf("list files failed: %v", err)
 		return err
 	}
 
@@ -384,6 +393,26 @@ func (s *Server) handle(ctx context.Context, event *github.PullRequestEvent) err
 			log.Errorf("failed to remove the repository , err : %v", err)
 		}
 	}()
+
+	opt := gitv2.ClientFactoryOpts{
+		CacheDirBase: github.String(s.codeCacheDir),
+		Persist:      github.Bool(true),
+		UseSSH:       github.Bool(false),
+		Username:     func() (string, error) { return "x-access-token", nil }, // x-access-token was used as github username
+		Token: func(org string) (string, error) {
+			installationToken, err := getGithubAppAccessToken(s.appID, s.appPrivateKey, installationID)
+			if err != nil {
+				log.Errorf("failed to get github app access token: %v", err)
+				return "", err
+			}
+			return installationToken, nil
+		},
+	}
+	gitClientFactory, err := gitv2.NewClientFactory(opt.Apply)
+	if err != nil {
+		log.Fatalf("failed to create git client factory: %v", err)
+	}
+	s.gitClientFactory = gitClientFactory
 
 	r, err := s.gitClientFactory.ClientForWithRepoOpts(org, repo, gitv2.RepoOpts{
 		CopyTo: defaultWorkDir + "/" + repo,
@@ -578,4 +607,73 @@ func (s *Server) PrepareExtraRef(org, repo, defaultWorkDir string) (repoClients 
 	}
 
 	return repoClients, nil
+}
+
+func createJWT(appID int64, privateKeyPEM []byte) (string, error) {
+	block, _ := pem.Decode(privateKeyPEM)
+	if block == nil {
+		return "", fmt.Errorf("can not decode private key pem")
+	}
+	var privateKey *rsa.PrivateKey
+	var err error
+
+	privateKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("parse private key failed: %w", err)
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		"iat": time.Now().Unix(),
+		"exp": time.Now().Add(time.Minute * 10).Unix(),
+		"iss": appID,
+	})
+	signedToken, err := token.SignedString(privateKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign jwt: %w", err)
+	}
+	return signedToken, nil
+
+}
+
+func getGithubAppAccessToken(appID int64, privateKey string, installationID int64) (string, error) {
+	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installationID)
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	privateKeyPem, err := os.ReadFile(privateKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to read private key: %w", err)
+	}
+	jwtToken, err := createJWT(appID, privateKeyPem)
+	if err != nil {
+		return "", fmt.Errorf("failed to create jwt: %w", err)
+	}
+	log.Debugf("jwtToken: %s", jwtToken)
+
+	req.Header.Set("Authorization", "Bearer "+jwtToken)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get access token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+	log.Debugf("response body: %s", string(body))
+
+	var tokenResponse struct {
+		AccessToken string `json:"token"`
+	}
+
+	err = json.Unmarshal(body, &tokenResponse)
+	if err != nil {
+		return "", fmt.Errorf("failed to unmarshal access token response: %w", err)
+	}
+
+	return tokenResponse.AccessToken, nil
 }

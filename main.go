@@ -28,14 +28,12 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/google/go-github/v57/github"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/qiniu/reviewbot/config"
 	"github.com/qiniu/reviewbot/internal/storage"
 	"github.com/qiniu/reviewbot/internal/version"
 	"github.com/qiniu/x/log"
 	"github.com/sirupsen/logrus"
-	gitv2 "sigs.k8s.io/prow/pkg/git/v2"
 
 	// linters import
 	_ "github.com/qiniu/reviewbot/internal/linters/c/cppcheck"
@@ -203,19 +201,10 @@ func main() {
 		}
 	}
 
-	opt := gitv2.ClientFactoryOpts{
-		CacheDirBase: github.String(o.codeCacheDir),
-		Persist:      github.Bool(true),
-		UseSSH:       github.Bool(true),
-	}
-	v2, err := gitv2.NewClientFactory(opt.Apply)
-	if err != nil {
-		log.Fatalf("failed to create git client factory: %v", err)
-	}
-
 	logrus.SetLevel(logrus.DebugLevel)
 
 	var cfg config.Config
+	var err error
 	if o.config != "" {
 		cfg, err = config.NewConfig(o.config)
 		if err != nil {
@@ -224,16 +213,16 @@ func main() {
 	}
 
 	s := &Server{
-		webhookSecret:    []byte(o.webhookSecret),
-		gitClientFactory: v2,
-		config:           cfg,
-		accessToken:      o.accessToken,
-		appID:            o.appID,
-		appPrivateKey:    o.appPrivateKey,
-		debug:            o.debug,
-		serverAddr:       o.serverAddr,
-		repoCacheDir:     o.codeCacheDir,
-		kubeConfig:       o.kubeConfig,
+		webhookSecret: []byte(o.webhookSecret),
+		codeCacheDir:  o.codeCacheDir,
+		config:        cfg,
+		accessToken:   o.accessToken,
+		appID:         o.appID,
+		appPrivateKey: o.appPrivateKey,
+		debug:         o.debug,
+		serverAddr:    o.serverAddr,
+		repoCacheDir:  o.codeCacheDir,
+		kubeConfig:    o.kubeConfig,
 	}
 
 	go s.initDockerRunner()
